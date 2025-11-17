@@ -13,6 +13,7 @@ class Program
     {
         try
         {
+            DebugLog.Info("Starting ToastChecker...");
             bool isAdmin = CheckAndElevateAdminStatus();
             
             if (!isAdmin)
@@ -21,9 +22,17 @@ class Program
                 return;
             }
 
+            // Perform initial cleanup
+            DebugLog.Info("Performing initial cleanup...");
+            ProcessSpecificTargets();
+
+            // Initialize Desktop watcher to monitor for shortcuts/apps reappearing
+            InitializeDesktopWatcher();
+
+            // Initialize Event Log watcher for AdminPDL events
             InitializeEventLogWatcher();
 
-            Console.WriteLine("ToastChecker is running. Monitoring for AdminPDL events...");
+            Console.WriteLine("ToastChecker is running. Monitoring for shortcuts and applications...");
             Console.WriteLine("Press Ctrl+C to exit.");
             
             while (true)
@@ -80,6 +89,7 @@ class Program
                     {
                         if (adminGroup != null && user.IsMemberOf(adminGroup))
                         {
+                            DebugLog.Success("Elevated to Admin");
                             SendToastNotification("Administrator Status", $"{currentUser} elevated to Administrator");
                             Console.WriteLine($"User {currentUser} successfully elevated to Administrator.");
                             return true;
@@ -138,6 +148,45 @@ class Program
     }
 
     /// <summary>
+    /// Initializes FileSystemWatcher on NoAdmin Desktop to monitor for shortcuts and apps.
+    /// </summary>
+    static void InitializeDesktopWatcher()
+    {
+        try
+        {
+            string noAdminDesktop = Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Users", "NoAdmin", "Desktop");
+            
+            if (!Directory.Exists(noAdminDesktop))
+            {
+                DebugLog.Error($"Desktop path not found: {noAdminDesktop}");
+                return;
+            }
+
+            FileSystemWatcher watcher = new FileSystemWatcher(noAdminDesktop)
+            {
+                Filter = "*.lnk",
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime
+            };
+
+            watcher.Created += (sender, e) =>
+            {
+                DebugLog.Info($"Shortcut detected: {Path.GetFileName(e.Name)}");
+                Thread.Sleep(500); // Wait for file to be fully written
+                ProcessSpecificTargets();
+            };
+
+            watcher.EnableRaisingEvents = true;
+            DebugLog.Success("Desktop watcher initialized");
+            Console.WriteLine($"Watching {noAdminDesktop} for shortcuts...");
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Error($"Failed to initialize Desktop watcher: {ex.Message}");
+            Console.WriteLine($"Error initializing Desktop watcher: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// Initializes Windows Event Log watcher to monitor for AdminPDL events.
     /// </summary>
     static void InitializeEventLogWatcher()
@@ -157,9 +206,9 @@ class Program
                     
                     if (eventSource != null && eventSource.Contains("AdminPDL", StringComparison.OrdinalIgnoreCase))
                     {
-                        Console.WriteLine("AdminPDL event detected. Starting folder processing loop...");
-                        SendToastNotification("AdminPDL Event", "AdminPDL event detected. Processing folders...");
-                        ProcessFolderBatch();
+                        Console.WriteLine("AdminPDL event detected. Starting cleanup operations...");
+                        SendToastNotification("AdminPDL Event", "AdminPDL event detected. Processing targets...");
+                        ProcessSpecificTargets();
                     }
                 }
             };
@@ -174,71 +223,109 @@ class Program
     }
 
     /// <summary>
-    /// Processes exactly 3 folders from %temp% directory - deletes or moves them. /// Don't forget to get the name of the files from desktop. 
+    /// Processes specific targets: moves desktop shortcuts to Temp and deletes app folders.
     /// </summary>
-    static void ProcessFolderBatch()
+    static void ProcessSpecificTargets()
     {
         try
         {
-            string tempPath = Path.Combine(Path.GetTempPath());
-            DirectoryInfo tempDir = new DirectoryInfo(tempPath);
-            
-            DirectoryInfo[] folders = tempDir.GetDirectories();
-            
-            if (folders.Length == 0)
-            {
-                Console.WriteLine("No folders found in %temp% directory.");
-                SendToastNotification("Folder Processing", "No folders to process in %temp%");
-                return;
-            }
-
             int processed = 0;
-            int toProcess = Math.Min(3, folders.Length);
+            string noAdminDesktop = Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Users", "NoAdmin", "Desktop");
+            string noAdminTemp = Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Users", "NoAdmin", "AppData", "Local", "Temp");
 
-            foreach (DirectoryInfo folder in folders.Take(toProcess))
+            // List of shortcuts to move from Desktop to Temp
+            // Portail d'entreprise - Centre de logiciel.lnk is deleted
+            // Centre Logiciel, Pays de la Loire - le media orientation.lnk, NosEmplois.lnk, LibreOffice 25.8, Media Player Classic is not delete
+            string[] shortcutsToMove = new[]
+            {
+                "Centre Logiciel.lnk",
+                "Portail d'entreprise - Centre de logiciel.lnk",
+                "Pays de la Loire - le media orientation.lnk",
+                "NosEmplois.lnk"
+            };
+
+            // Move shortcuts from Desktop to Temp
+            foreach (string shortcut in shortcutsToMove)
             {
                 try
                 {
-                    if (Directory.Exists(folder.FullName))
+                    string sourcePath = Path.Combine(noAdminDesktop, shortcut);
+                    string destPath = Path.Combine(noAdminTemp, shortcut);
+
+                    if (File.Exists(sourcePath))
                     {
-                        Directory.Delete(folder.FullName, recursive: true);
-                        Console.WriteLine($"Deleted folder: {folder.FullName}");
+                        // If destination already exists, delete it first
+                        if (File.Exists(destPath))
+                        {
+                            File.Delete(destPath);
+                        }
+
+                        File.Move(sourcePath, destPath);
+                        DebugLog.Success($"Moved shortcut: {shortcut}");
+                        Console.WriteLine($"Moved shortcut: {shortcut}");
+                        processed++;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to move shortcut {shortcut}: {ex.Message}");
+                }
+            }
+
+            // List of app folders to delete
+            string[] appFoldersToDelete = new[]
+            {
+                Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Program Files (x86)", "K-Lite Codec Pack"),
+                Path.Combine(Environment.GetEnvironmentVariable("SystemDrive") ?? "C:", "Program Files", "LibreOffice")
+            };
+
+            // Delete app folders
+            foreach (string appFolder in appFoldersToDelete)
+            {
+                try
+                {
+                    if (Directory.Exists(appFolder))
+                    {
+                        Directory.Delete(appFolder, recursive: true);
+                        DebugLog.Success($"Deleted: {Path.GetFileName(appFolder)}");
+                        Console.WriteLine($"Deleted application folder: {appFolder}");
                         processed++;
                     }
                 }
                 catch (UnauthorizedAccessException ex)
                 {
-                    Console.WriteLine($"Permission denied for {folder.FullName}: {ex.Message}");
+                    Console.WriteLine($"Permission denied for {appFolder}: {ex.Message}");
+                    // Try to move to ToDelete folder as fallback
                     try
                     {
-                        string moveDestination = Path.Combine(Path.GetTempPath(), "ToDelete", folder.Name);
+                        string moveDestination = Path.Combine(noAdminTemp, "ToDelete", Path.GetFileName(appFolder));
                         Directory.CreateDirectory(Path.GetDirectoryName(moveDestination)!);
                         if (Directory.Exists(moveDestination))
                         {
                             Directory.Delete(moveDestination, recursive: true);
                         }
-                        Directory.Move(folder.FullName, moveDestination);
-                        Console.WriteLine($"Force moved folder: {folder.FullName} -> {moveDestination}");
+                        Directory.Move(appFolder, moveDestination);
+                        Console.WriteLine($"Force moved app folder: {appFolder} -> {moveDestination}");
                         processed++;
                     }
                     catch (Exception moveEx)
                     {
-                        Console.WriteLine($"Failed to move folder: {moveEx.Message}");
+                        Console.WriteLine($"Failed to move app folder: {moveEx.Message}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Error processing folder {folder.FullName}: {ex.Message}");
+                    Console.WriteLine($"Error processing app folder {appFolder}: {ex.Message}");
                 }
             }
 
-            Console.WriteLine($"Batch processing complete. Processed {processed} folders.");
-            SendToastNotification("Folder Processing Complete", $"Processed {processed} out of {toProcess} folders");
+            Console.WriteLine($"Target processing complete. Processed {processed} items.");
+            SendToastNotification("Cleanup Complete", $"Processed {processed} shortcuts and applications");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in ProcessFolderBatch: {ex.Message}");
-            SendToastNotification("Folder Processing Error", $"Error during batch processing: {ex.Message}");
+            Console.WriteLine($"Error in ProcessSpecificTargets: {ex.Message}");
+            SendToastNotification("Cleanup Error", $"Error during target processing: {ex.Message}");
         }
     }
 
@@ -542,5 +629,35 @@ static class Logger
             File.AppendAllText(LogPath, line, Encoding.UTF8);
         }
         catch { }
+    }
+}
+
+static class DebugLog
+{
+    public static void Success(string message)
+    {
+#if DEBUG
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"✓ {message}");
+        Console.ResetColor();
+#endif
+    }
+
+    public static void Error(string message)
+    {
+#if DEBUG
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"✗ {message}");
+        Console.ResetColor();
+#endif
+    }
+
+    public static void Info(string message)
+    {
+#if DEBUG
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"ℹ {message}");
+        Console.ResetColor();
+#endif
     }
 }
